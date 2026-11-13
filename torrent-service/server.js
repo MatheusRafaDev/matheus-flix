@@ -5,6 +5,8 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { spawn } from 'child_process';
 import WebTorrent from 'webtorrent';
+import { initDb, upsertMovie, searchCatalog, getGenresSummary } from './db.js';
+import { seedCatalog, scanLocalMovies } from './seeder.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -14,6 +16,9 @@ const SAVE_PATH = process.env.SAVE_PATH || 'D:\\filmes';
 const JELLYFIN_URL = process.env.JELLYFIN_URL || 'http://localhost:8096';
 const JELLYFIN_USER = process.env.JELLYFIN_USER || 'rafae';
 const JELLYFIN_PW = process.env.JELLYFIN_PW || '10092004';
+
+// Initialize SQLite database
+initDb();
 
 // Ensure save path directory exists
 try {
@@ -111,7 +116,7 @@ function formatTime(ms) {
 function fetchJson(url) {
     return new Promise((resolve, reject) => {
         const clientLib = url.startsWith('https') ? https : http;
-        const req = clientLib.get(url, { headers: { 'User-Agent': 'Mozilla/5.0 MatheusFlix/1.0' } }, (res) => {
+        const req = clientLib.get(url, { headers: { 'User-Agent': 'Mozilla/5.0 MatheusFlix/2.0' } }, (res) => {
             if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
                 return fetchJson(res.headers.location).then(resolve).catch(reject);
             }
@@ -149,7 +154,7 @@ async function refreshJellyfinLibrary() {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
-                    'X-Emby-Authorization': 'MediaBrowser Client="MatheusFlix TorrentService", Device="Node", DeviceId="matheusflix_torrent", Version="1.0.0"'
+                    'X-Emby-Authorization': 'MediaBrowser Client="MatheusFlix TorrentService", Device="Node", DeviceId="matheusflix_torrent", Version="2.0.0"'
                 }
             }, (res) => {
                 let data = '';
@@ -187,9 +192,6 @@ async function refreshJellyfinLibrary() {
     }
 }
 
-// Cache for trending movies
-let trendingCache = { data: null, timestamp: 0 };
-
 // Create HTTP server
 const server = http.createServer(async (req, res) => {
     // Enable CORS
@@ -220,38 +222,84 @@ const server = http.createServer(async (req, res) => {
             return;
         }
 
-        // Trending Movies
-        if (pathname === '/api/movies/trending' && req.method === 'GET') {
-            const now = Date.now();
-            if (trendingCache.data && (now - trendingCache.timestamp < 15 * 60 * 1000)) {
-                res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-                res.end(JSON.stringify(trendingCache.data));
-                return;
-            }
-
-            try {
-                const cinemeta = await fetchJson('https://cinemeta-catalogs.strem.io/top/catalog/movie/top.json');
-                const movies = (cinemeta.metas || []).slice(0, 30).map(m => ({
-                    imdb_id: m.imdb_id,
-                    name: m.name,
-                    year: m.releaseInfo || m.year,
-                    poster: m.poster,
-                    description: m.description,
-                    genres: m.genres || [],
-                    rating: m.imdbRating || (m.popularities?.moviedb ? (m.popularities.moviedb / 10).toFixed(1) : null)
-                }));
-                trendingCache = { data: { movies }, timestamp: now };
-                res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-                res.end(JSON.stringify({ movies }));
-            } catch (err) {
-                console.error('[TorrentService] Trending error:', err.message);
-                res.writeHead(500, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ error: err.message }));
-            }
+        // Genres endpoint
+        if (pathname === '/api/genres' && req.method === 'GET') {
+            const genres = getGenresSummary();
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ genres }));
             return;
         }
 
-        // Search Movies
+        // Unified Movie Catalog Search & Filtering (SQLite backed)
+        if (pathname === '/api/movies' && req.method === 'GET') {
+            const q = urlObj.searchParams.get('q') || '';
+            const genre = urlObj.searchParams.get('genre') || 'all';
+            const year = urlObj.searchParams.get('year') || 'all';
+            const sort = urlObj.searchParams.get('sort') || 'trending';
+            const limit = parseInt(urlObj.searchParams.get('limit'), 10) || 40;
+            const offset = parseInt(urlObj.searchParams.get('offset'), 10) || 0;
+
+            const results = searchCatalog({ q, genre, year, sort, limit, offset });
+
+            // If empty and search query provided, try live search
+            if (results.movies.length === 0 && q.trim().length > 1) {
+                try {
+                    const searchUrl = `https://v3-cinemeta.strem.io/catalog/movie/top/search=${encodeURIComponent(q)}.json`;
+                    const cinemeta = await fetchJson(searchUrl);
+                    if (cinemeta?.metas && Array.isArray(cinemeta.metas)) {
+                        cinemeta.metas.forEach(m => upsertMovie(m));
+                        // Re-query
+                        const freshResults = searchCatalog({ q, genre, year, sort, limit, offset });
+                        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+                        res.end(JSON.stringify(freshResults));
+                        return;
+                    }
+                } catch (e) {
+                    // Fall through to existing results
+                }
+            }
+
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify(results));
+            return;
+        }
+
+        // Trending Movies (Backward-compatible, powered by SQLite)
+        if (pathname === '/api/movies/trending' && req.method === 'GET') {
+            const genre = urlObj.searchParams.get('genre') || 'all';
+            const year = urlObj.searchParams.get('year') || 'all';
+            const sort = urlObj.searchParams.get('sort') || 'trending';
+
+            const results = searchCatalog({ genre, year, sort, limit: 50, offset: 0 });
+
+            // If database still seeding and has few movies, fetch live Cinemeta
+            if (results.movies.length < 5) {
+                try {
+                    const cinemeta = await fetchJson('https://cinemeta-catalogs.strem.io/top/catalog/movie/top.json');
+                    const movies = (cinemeta.metas || []).map(m => {
+                        upsertMovie(m);
+                        return {
+                            imdb_id: m.imdb_id,
+                            name: m.name,
+                            year: m.releaseInfo || m.year,
+                            poster: m.poster,
+                            description: m.description,
+                            genres: m.genres || [],
+                            rating: m.imdbRating || (m.popularities?.moviedb ? (m.popularities.moviedb / 10).toFixed(1) : null)
+                        };
+                    });
+                    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+                    res.end(JSON.stringify({ movies }));
+                    return;
+                } catch (err) {}
+            }
+
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ movies: results.movies }));
+            return;
+        }
+
+        // Search Movies (FTS5 + Live Fallback)
         if (pathname === '/api/movies/search' && req.method === 'GET') {
             const query = urlObj.searchParams.get('q');
             if (!query) {
@@ -260,25 +308,32 @@ const server = http.createServer(async (req, res) => {
                 return;
             }
 
-            try {
-                const searchUrl = `https://v3-cinemeta.strem.io/catalog/movie/top/search=${encodeURIComponent(query)}.json`;
-                const cinemeta = await fetchJson(searchUrl);
-                const movies = (cinemeta.metas || []).map(m => ({
-                    imdb_id: m.imdb_id,
-                    name: m.name,
-                    year: m.releaseInfo || m.year,
-                    poster: m.poster,
-                    description: m.description,
-                    genres: m.genres || [],
-                    rating: m.imdbRating || (m.popularities?.moviedb ? (m.popularities.moviedb / 10).toFixed(1) : null)
-                }));
-                res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-                res.end(JSON.stringify({ movies }));
-            } catch (err) {
-                console.error('[TorrentService] Movie search error:', err.message);
-                res.writeHead(500, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ error: err.message }));
+            const results = searchCatalog({ q: query, limit: 40 });
+
+            if (results.movies.length < 5) {
+                try {
+                    const searchUrl = `https://v3-cinemeta.strem.io/catalog/movie/top/search=${encodeURIComponent(query)}.json`;
+                    const cinemeta = await fetchJson(searchUrl);
+                    if (cinemeta?.metas) {
+                        cinemeta.metas.forEach(m => upsertMovie(m));
+                        const fresh = searchCatalog({ q: query, limit: 40 });
+                        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+                        res.end(JSON.stringify({ movies: fresh.movies }));
+                        return;
+                    }
+                } catch (err) {}
             }
+
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ movies: results.movies }));
+            return;
+        }
+
+        // Trigger manual catalog sync
+        if (pathname === '/api/movies/sync' && req.method === 'POST') {
+            seedCatalog(SAVE_PATH).catch(console.error);
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ message: 'Sincronização de catálogo iniciada' }));
             return;
         }
 
@@ -292,7 +347,6 @@ const server = http.createServer(async (req, res) => {
             }
 
             try {
-                // Fetch standard streams and portuguese streams in parallel
                 const [allStreamsRes, ptStreamsRes] = await Promise.allSettled([
                     fetchJson(`https://torrentio.strem.fun/stream/movie/${imdb}.json`),
                     fetchJson(`https://torrentio.strem.fun/language=portuguese/stream/movie/${imdb}.json`)
@@ -310,29 +364,23 @@ const server = http.createServer(async (req, res) => {
                         const fullText = `${s.name || ''} ${s.title || ''}`;
                         const isPt = isPtSource || /dublado|dual|nacional|portuguese|\bpt\b|\bbr\b|🇧🇷|🇵🇹/i.test(fullText);
 
-                        // Parse seeders
                         const seedsMatch = s.title?.match(/👤\s*(\d+)/);
                         const seeders = seedsMatch ? parseInt(seedsMatch[1], 10) : 0;
 
-                        // Parse size
                         const sizeMatch = s.title?.match(/💾\s*([\d\.]+\s*[GMK]B)/i);
                         const size = sizeMatch ? sizeMatch[1] : '';
 
-                        // Parse provider
                         const providerMatch = s.title?.match(/⚙️\s*([^\n\r]+)/);
                         const provider = providerMatch ? providerMatch[1].trim() : 'Torrentio';
 
-                        // Parse clean title / release
                         const firstLine = (s.title || '').split('\n')[0].trim();
                         const filename = s.behaviorHints?.filename || firstLine;
 
-                        // Parse quality
                         let quality = 'HD';
                         if (/4k|2160p/i.test(fullText)) quality = '4K UHD';
                         else if (/1080p/i.test(fullText)) quality = '1080p Full HD';
                         else if (/720p/i.test(fullText)) quality = '720p HD';
 
-                        // Audio classification
                         let audio = 'Original / Legendado';
                         if (/dublado|dual|nacional/i.test(fullText)) {
                             audio = '🇧🇷 Dual Áudio / Dublado';
@@ -365,7 +413,6 @@ const server = http.createServer(async (req, res) => {
                     processStreams(allStreamsRes.value.streams, false);
                 }
 
-                // Sort: Portuguese / Dual Áudio first, then by seeders descending
                 const torrents = Array.from(streamMap.values()).sort((a, b) => {
                     if (a.isPortuguese && !b.isPortuguese) return -1;
                     if (!a.isPortuguese && b.isPortuguese) return 1;
@@ -404,7 +451,6 @@ const server = http.createServer(async (req, res) => {
                         createdAt: meta.createdAt
                     };
                 }
-                // If not currently in client (e.g. already finished and persisted)
                 return {
                     id: meta.id,
                     imdbId: meta.imdbId,
@@ -442,7 +488,6 @@ const server = http.createServer(async (req, res) => {
                         return;
                     }
 
-                    // Extract infoHash from magnet
                     const hashMatch = magnet.match(/btih:([a-fA-F0-9]{40}|[a-zA-Z2-7]{32})/i);
                     const infoHash = hashMatch ? hashMatch[1].toLowerCase() : null;
 
@@ -452,7 +497,6 @@ const server = http.createServer(async (req, res) => {
                         return;
                     }
 
-                    // Check if already active
                     const existingTorrent = client.get(infoHash);
                     if (existingTorrent) {
                         res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -462,7 +506,6 @@ const server = http.createServer(async (req, res) => {
 
                     console.log(`[TorrentService] Starting download: "${title || filename}" into ${SAVE_PATH}`);
 
-                    // Register in metadata map
                     const metaItem = {
                         id: infoHash,
                         imdbId: imdbId || '',
@@ -474,7 +517,6 @@ const server = http.createServer(async (req, res) => {
                     downloadsRegistry.set(infoHash, metaItem);
                     persistDownloads();
 
-                    // Add to client
                     const torrent = client.add(magnet, { path: SAVE_PATH }, (t) => {
                         console.log(`[TorrentService] Torrent ready: "${t.name}" (${formatBytes(t.length)})`);
                     });
@@ -490,7 +532,7 @@ const server = http.createServer(async (req, res) => {
                             item.completedAt = new Date().toISOString();
                             persistDownloads();
                         }
-                        // Trigger Jellyfin scan
+                        scanLocalMovies(SAVE_PATH);
                         refreshJellyfinLibrary();
                     });
 
@@ -583,4 +625,9 @@ server.listen(PORT, () => {
     console.log(`📁 Pasta de Destino: ${SAVE_PATH}`);
     console.log(`🍿 Jellyfin Server: ${JELLYFIN_URL}`);
     console.log(`=======================================================`);
+
+    // Start background catalog seeding
+    seedCatalog(SAVE_PATH).catch(err => {
+        console.warn('[TorrentService] Background seeding error:', err.message);
+    });
 });
