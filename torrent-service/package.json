@@ -1,0 +1,13 @@
+{
+  "name": "matheusflix-torrent-service",
+  "version": "1.0.0",
+  "description": "Companion service for MatheusFlix: Movie discovery and Torrent downloader",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "webtorrent": "^2.5.11"
+  }
+}
