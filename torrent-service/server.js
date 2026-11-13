@@ -7,6 +7,7 @@ import { spawn } from 'child_process';
 import WebTorrent from 'webtorrent';
 import { initDb, upsertMovie, searchCatalog, getGenresSummary } from './db.js';
 import { seedCatalog, scanLocalMovies } from './seeder.js';
+import { askAiMovieRecommendations } from './aiSearch.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -227,6 +228,27 @@ const server = http.createServer(async (req, res) => {
             const genres = getGenresSummary();
             res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
             res.end(JSON.stringify({ genres }));
+            return;
+        }
+
+        // AI Movie Search & Semantic Recommendations
+        if (pathname === '/api/ai/search' && req.method === 'GET') {
+            const query = urlObj.searchParams.get('q') || urlObj.searchParams.get('prompt') || '';
+            if (!query) {
+                res.writeHead(400, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: 'Query parameter q is required' }));
+                return;
+            }
+
+            try {
+                const movies = await askAiMovieRecommendations(query);
+                res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+                res.end(JSON.stringify({ query, movies }));
+            } catch (err) {
+                console.error('[TorrentService] AI search error:', err.message);
+                res.writeHead(500, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: err.message }));
+            }
             return;
         }
 
