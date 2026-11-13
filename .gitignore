@@ -1,0 +1,12 @@
+# Builds e caches
+node_modules/
+jellyfin-web/node_modules/
+jellyfin-web/dist/
+
+# Logs e temporários
+*.log
+npm-debug.log*
+
+# Sistema
+.DS_Store
+Thumbs.db
