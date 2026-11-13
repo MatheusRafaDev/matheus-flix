@@ -8,6 +8,7 @@ import WebTorrent from 'webtorrent';
 import { initDb, upsertMovie, searchCatalog, getGenresSummary } from './db.js';
 import { seedCatalog, scanLocalMovies } from './seeder.js';
 import { askAiMovieRecommendations } from './aiSearch.js';
+import { getLocalLibrary, streamLocalVideo } from './localScanner.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -232,28 +233,47 @@ const server = http.createServer(async (req, res) => {
         }
 
         // AI Movie Search & Semantic Recommendations
-        if (pathname === '/api/ai/search' && req.method === 'GET') {
-            const query = urlObj.searchParams.get('q') || urlObj.searchParams.get('prompt') || '';
-            if (!query) {
-                res.writeHead(400, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ error: 'Query parameter q is required' }));
-                return;
-            }
+        if ((pathname === '/api/ai/search' || pathname === '/api/ai-search') && (req.method === 'GET' || req.method === 'POST')) {
+            let query = urlObj.searchParams.get('q') || urlObj.searchParams.get('prompt') || '';
 
-            try {
-                const movies = await askAiMovieRecommendations(query);
-                res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-                res.end(JSON.stringify({ query, movies }));
-            } catch (err) {
-                console.error('[TorrentService] AI search error:', err.message);
-                res.writeHead(500, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ error: err.message }));
+            const handleAi = async (qText) => {
+                if (!qText) {
+                    res.writeHead(400, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ error: 'Query parameter q or prompt is required' }));
+                    return;
+                }
+                try {
+                    const result = await askAiMovieRecommendations(qText);
+                    const movies = Array.isArray(result) ? result : (result.movies || []);
+                    const reasoning = result.reasoning || '';
+                    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+                    res.end(JSON.stringify({ query: qText, movies, reasoning }));
+                } catch (err) {
+                    console.error('[TorrentService] AI search error:', err.message);
+                    res.writeHead(500, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ error: err.message }));
+                }
+            };
+
+            if (req.method === 'POST') {
+                let body = '';
+                req.on('data', chunk => body += chunk);
+                req.on('end', () => {
+                    try {
+                        const parsed = JSON.parse(body || '{}');
+                        handleAi(parsed.prompt || parsed.q || query);
+                    } catch (e) {
+                        handleAi(query);
+                    }
+                });
+            } else {
+                handleAi(query);
             }
             return;
         }
 
         // Unified Movie Catalog Search & Filtering (SQLite backed)
-        if (pathname === '/api/movies' && req.method === 'GET') {
+        if ((pathname === '/api/movies' || pathname === '/api/catalog') && req.method === 'GET') {
             const q = urlObj.searchParams.get('q') || '';
             const genre = urlObj.searchParams.get('genre') || 'all';
             const year = urlObj.searchParams.get('year') || 'all';
@@ -360,8 +380,8 @@ const server = http.createServer(async (req, res) => {
         }
 
         // Search Torrents for a Movie
-        if (pathname === '/api/torrents/search' && req.method === 'GET') {
-            const imdb = urlObj.searchParams.get('imdb');
+        if ((pathname === '/api/torrents/search' || pathname === '/api/torrents') && req.method === 'GET') {
+            const imdb = urlObj.searchParams.get('imdb') || urlObj.searchParams.get('imdbId');
             if (!imdb) {
                 res.writeHead(400, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({ error: 'Parameter imdb is required' }));
@@ -445,6 +465,63 @@ const server = http.createServer(async (req, res) => {
                 res.end(JSON.stringify({ torrents }));
             } catch (err) {
                 console.error('[TorrentService] Torrent search error:', err.message);
+                res.writeHead(500, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: err.message }));
+            }
+            return;
+        }
+
+        // Get local movies library (from D:\filmes with posters and metadata)
+        if (pathname === '/api/local-movies' && req.method === 'GET') {
+            try {
+                const force = urlObj.searchParams.get('force') === 'true';
+                const movies = await getLocalLibrary(SAVE_PATH, force);
+                const totalBytes = movies.reduce((acc, m) => acc + (m.sizeBytes || 0), 0);
+                res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+                res.end(JSON.stringify({
+                    movies,
+                    count: movies.length,
+                    totalSize: formatBytes(totalBytes),
+                    savePath: SAVE_PATH
+                }));
+            } catch (err) {
+                console.error('[TorrentService] Local movies error:', err.message);
+                res.writeHead(500, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: err.message }));
+            }
+            return;
+        }
+
+        // Rescan local movies library
+        if (pathname === '/api/local-movies/rescan' && req.method === 'POST') {
+            try {
+                const movies = await getLocalLibrary(SAVE_PATH, true);
+                refreshJellyfinLibrary();
+                res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+                res.end(JSON.stringify({
+                    success: true,
+                    count: movies.length,
+                    message: 'Biblioteca local re-escaneada e atualizada com sucesso!'
+                }));
+            } catch (err) {
+                res.writeHead(500, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: err.message }));
+            }
+            return;
+        }
+
+        // Stream local file with HTTP Range (206 Partial Content)
+        if (pathname === '/api/local/stream' && req.method === 'GET') {
+            const filePath = urlObj.searchParams.get('file');
+            if (!filePath) {
+                res.writeHead(400, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: 'file query parameter is required' }));
+                return;
+            }
+            try {
+                streamLocalVideo(filePath, req, res);
+            } catch (err) {
+                console.error('[TorrentService] Local stream error:', err.message);
                 res.writeHead(500, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({ error: err.message }));
             }

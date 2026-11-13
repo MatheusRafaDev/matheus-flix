@@ -238,7 +238,7 @@ export function searchCatalog({ q = '', genre = 'all', year = null, sort = 'tren
 
     // Data query
     const queryStmt = database.prepare(`
-        SELECT imdb_id, title as name, original_title, year, release_date, genres,
+        SELECT imdb_id, title, title as name, original_title, year, release_date, genres,
                rating, poster, backdrop, description, popularity, is_local
         FROM movies
         ${whereSql}
@@ -288,3 +288,4 @@ export function markLocalMovies(movieTitles = []) {
         }
     });
 }
+
